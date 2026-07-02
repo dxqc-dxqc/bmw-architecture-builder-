@@ -121,3 +121,31 @@ def scan_local_directory_to_tree_data(root_path):
 
     traverse(root_path)
     return tree_nodes
+
+# 在 src/core_logic.py 的原有代码最后追加以下内容：
+
+import json
+
+CACHE_FILE_PATH = "history/.last_session.json"
+
+def save_last_session_cache(state_data):
+    """【持久化存储】将当前最新的架构快照无感写入本地隐藏的缓存JSON中"""
+    try:
+        ensure_history_dir()
+        with open(CACHE_FILE_PATH, "w", encoding="utf-8") as f:
+            json.dump(state_data, f, ensure_ascii=False, indent=4)
+    except Exception:
+        pass # 静默处理，防止由于磁盘权限导致用户操作卡死
+
+def load_last_session_cache():
+    """【持久化恢复】读取上一次软件关闭前的最终物理镜像快照"""
+    if not os.path.exists(CACHE_FILE_PATH):
+        return None
+    try:
+        with open(CACHE_FILE_PATH, "r", encoding="utf-8") as f:
+            state_data = json.load(f)
+            if isinstance(state_data, list):
+                return state_data
+    except Exception:
+        return None
+    return None
