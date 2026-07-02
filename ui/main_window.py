@@ -1,4 +1,6 @@
 # ui/main_window.py
+import json
+import os
 from PyQt6.QtWidgets import (
     QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QPushButton, QLineEdit, QTreeWidgetItem, QFileDialog, QMessageBox, QFrame, QTextEdit
@@ -9,7 +11,8 @@ from PyQt6.QtCore import Qt
 from ui.custom_widgets import RobustTreeWidget
 from src.core_logic import (
     generate_markdown_text, parse_markdown_to_tree_data,
-    ensure_history_dir, scan_local_directory_to_tree_data
+    ensure_history_dir, scan_local_directory_to_tree_data,
+    save_last_session_cache, load_last_session_cache
 )
 
 BMW_COLORS = {
@@ -51,7 +54,19 @@ class ArchitectureBuilder(QMainWindow):
         self.resize(1200, 800)
         self.setStyleSheet(BMW_STYLE_SHEET)
         ensure_history_dir()
+
+        # 历史回溯双栈
+        self.undo_stack = []
+        self.redo_stack = []
+        self.block_snapshot = False
+
         self.init_ui()
+
+        # 1. 初始状态先记录一次绝对空树快照，确保能“一直回溯到最开始的位置”
+        self.save_snapshot(write_to_disk=False)  # 初始空状态不需要覆盖本地有效的缓存
+
+        # 🚀 2. 【核心功能升级：启动时自动读取最新一次的本地快照】
+        self.auto_load_last_session()
 
     def init_ui(self):
         main_widget = QWidget()
@@ -91,7 +106,7 @@ class ArchitectureBuilder(QMainWindow):
         panel_title.setFont(QFont("Microsoft YaHei", 11, QFont.Weight.Bold))
         left_layout.addWidget(panel_title)
 
-        # 🚀【功能升级：双重读取入口排版布局】
+        # 双重读取入口排版布局
         btn_box = QHBoxLayout()
         btn_box.setSpacing(8)
 
@@ -110,6 +125,30 @@ class ArchitectureBuilder(QMainWindow):
         btn_box.addWidget(self.btn_load_history)
 
         left_layout.addLayout(btn_box)
+
+        # 时间回溯控制组
+        history_title = QLabel("架构时间线回溯")
+        history_title.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Bold))
+        left_layout.addWidget(history_title)
+
+        timeline_box = QHBoxLayout()
+        timeline_box.setSpacing(8)
+
+        self.btn_undo = QPushButton("⏮ 撤销变更 (Undo)")
+        self.btn_undo.setObjectName("SecondaryButton")
+        self.btn_undo.setStyleSheet("padding: 8px; font-size: 12px;")
+        self.btn_undo.setEnabled(False)
+        self.btn_undo.clicked.connect(self.undo)
+        timeline_box.addWidget(self.btn_undo)
+
+        self.btn_redo = QPushButton("⏭ 重做变更 (Redo)")
+        self.btn_redo.setObjectName("SecondaryButton")
+        self.btn_redo.setStyleSheet("padding: 8px; font-size: 12px;")
+        self.btn_redo.setEnabled(False)
+        self.btn_redo.clicked.connect(self.redo)
+        timeline_box.addWidget(self.btn_redo)
+
+        left_layout.addLayout(timeline_box)
 
         left_layout.addWidget(QLabel("节点名称："))
         self.name_input = QLineEdit()
@@ -175,13 +214,108 @@ class ArchitectureBuilder(QMainWindow):
         self.tree.setFont(QFont("Microsoft YaHei", 10, QFont.Weight.Light))
         self.tree.itemClicked.connect(self.on_item_clicked)
 
+        # 监听树状图内部由于拖拽物理落位引发的层级改变
+        self.tree.model().rowsMoved.connect(lambda: self.save_snapshot())
+
         workspace_layout.addWidget(self.tree)
         outer_layout.addWidget(workspace)
+
+    # --- 核心时间线回溯引擎 ---
+
+    def _serialize_tree_to_data(self):
+        """将当前的树形 UI 实体深度压缩提取为纯数据格式的扁平节点列表"""
+
+        def recurse(item, indent_level=0):
+            nodes = []
+            node_type = item.data(0, Qt.ItemDataRole.UserRole)
+            name = item.data(1, Qt.ItemDataRole.UserRole) or ""
+            desc = item.data(2, Qt.ItemDataRole.UserRole) or ""
+
+            nodes.append({
+                'indent': indent_level * 2,
+                'name': name,
+                'desc': desc,
+                'type': node_type
+            })
+            for i in range(item.childCount()):
+                nodes.extend(recurse(item.child(i), indent_level + 1))
+            return nodes
+
+        serialized_data = []
+        for i in range(self.tree.topLevelItemCount()):
+            serialized_data.extend(recurse(self.tree.topLevelItem(i)))
+        return serialized_data
+
+    def save_snapshot(self, write_to_disk=True):
+        """在任何写操作发生时，将当前右侧状态打包为不朽快照推入撤销栈，并静默写入本地缓存"""
+        if self.block_snapshot:
+            return
+
+        current_state = self._serialize_tree_to_data()
+
+        if self.undo_stack and self.undo_stack[-1] == current_state:
+            return
+
+        self.undo_stack.append(current_state)
+        self.redo_stack.clear()
+        self._update_timeline_buttons_status()
+
+        # 🚀【功能升级：每次状态变更，实时同步持久化保存到本地隐藏文件中】
+        if write_to_disk:
+            save_last_session_cache(current_state)
+
+    def auto_load_last_session(self):
+        """🚀【新核心功能】启动时静默检查并加载最新一次的本地会话快照"""
+        last_state = load_last_session_cache()
+        if last_state:
+            self.block_snapshot = True
+            self._render_node_list_to_tree(last_state)
+            self.block_snapshot = False
+
+            # 将读取到的历史状态压入撤销栈，使得刚开机时也可以选择 Undo 撤销回最开始的空白状态
+            self.undo_stack.append(last_state)
+            self._update_timeline_buttons_status()
+
+    def undo(self):
+        """退回上一步"""
+        if len(self.undo_stack) <= 1:
+            return
+
+        current_state = self.undo_stack.pop()
+        self.redo_stack.append(current_state)
+        previous_state = self.undo_stack[-1]
+
+        self.block_snapshot = True
+        self._render_node_list_to_tree(previous_state)
+        self.block_snapshot = False
+
+        self._update_timeline_buttons_status()
+        # 撤销后，本地最新缓存也随之同步回滚
+        save_last_session_cache(previous_state)
+
+    def redo(self):
+        """前进一步"""
+        if not self.redo_stack:
+            return
+
+        next_state = self.redo_stack.pop()
+        self.undo_stack.append(next_state)
+
+        self.block_snapshot = True
+        self._render_node_list_to_tree(next_state)
+        self.block_snapshot = False
+
+        self._update_timeline_buttons_status()
+        # 重做后，本地最新缓存也随之同步前进
+        save_last_session_cache(next_state)
+
+    def _update_timeline_buttons_status(self):
+        self.btn_undo.setEnabled(len(self.undo_stack) > 1)
+        self.btn_redo.setEnabled(len(self.redo_stack) > 0)
 
     # --- UI 交互与渲染引擎 ---
 
     def _render_node_list_to_tree(self, node_list):
-        """【公用绘制函数】将扁平化的节点缩进列表顺序组装为具有深度的树状拓扑图"""
         self.tree.clear()
         self.name_input.clear()
         self.desc_input.clear()
@@ -218,27 +352,23 @@ class ArchitectureBuilder(QMainWindow):
             history_stack.append((node['indent'], new_item))
 
     def load_from_local_directory(self):
-        """【新功能业务映射】选择并载入一个本地文件夹，将其真实架构显示在右侧界面上供直接修改"""
         dir_path = QFileDialog.getExistingDirectory(self, "选择你想要载入扫描的项目文件夹")
         if not dir_path:
             return
 
         try:
-            # 扫描本地物理目录结构
             node_list = scan_local_directory_to_tree_data(dir_path)
             if not node_list:
-                QMessageBox.information(self, "提示", "所选文件夹为空，或者没有符合条件的非隐藏文件。")
+                QMessageBox.information(self, "提示", "所选文件夹为空。")
                 return
 
-            # 驱动渲染
             self._render_node_list_to_tree(node_list)
-            QMessageBox.information(self, "载入成功",
-                                    f"成功抓取了本地项目物理架构！共载入 {len(node_list)} 个文件/文件夹。你可以在右侧自由拖拽、重命名或为其添加功能说明。")
+            self.save_snapshot()
+            QMessageBox.information(self, "载入成功", f"成功抓取了本地项目物理架构！")
         except Exception as e:
-            QMessageBox.critical(self, "系统故障", f"无法读取或扫描该本地文件夹: {str(e)}")
+            QMessageBox.critical(self, "系统故障", f"无法读取该本地文件夹: {str(e)}")
 
     def load_from_history_md(self):
-        """读取过往导出的 MD 规格历史文件并还原架构树"""
         file_path, _ = QFileDialog.getOpenFileName(
             self, "读取历史架构蓝图", "history", "Markdown 规范文件 (*.md)"
         )
@@ -255,11 +385,10 @@ class ArchitectureBuilder(QMainWindow):
                 return
 
             self._render_node_list_to_tree(node_list)
-            QMessageBox.information(self, "架构恢复成功", f"成功从历史文件中逆向加载了 {len(node_list)} 个架构节点！")
+            self.save_snapshot()
+            QMessageBox.information(self, "架构恢复成功", f"成功从历史文件中逆向加载了架构节点！")
         except Exception as e:
             QMessageBox.critical(self, "系统故障", f"逆向解析历史架构文件失败: {str(e)}")
-
-    # --- 基础节点控制逻辑 ---
 
     def add_node(self, is_folder):
         name = self.name_input.text().strip()
@@ -272,7 +401,7 @@ class ArchitectureBuilder(QMainWindow):
         if selected_items:
             parent = selected_items[0]
             if parent.data(0, Qt.ItemDataRole.UserRole) == "file":
-                QMessageBox.warning(self, "结构错误", "无法在文件内创建子项。请先选择文件夹。")
+                QMessageBox.warning(self, "结构错误", "无法在文件内创建子项。")
                 return
             new_item = QTreeWidgetItem(parent)
             self.tree.expandItem(parent)
@@ -296,6 +425,8 @@ class ArchitectureBuilder(QMainWindow):
 
         self.name_input.clear()
         self.desc_input.clear()
+
+        self.save_snapshot()
 
     def on_item_clicked(self, item, column):
         self.name_input.setText(item.data(1, Qt.ItemDataRole.UserRole) or "")
@@ -325,6 +456,8 @@ class ArchitectureBuilder(QMainWindow):
         item.setData(1, Qt.ItemDataRole.UserRole, new_name)
         item.setData(2, Qt.ItemDataRole.UserRole, new_desc)
 
+        self.save_snapshot()
+
     def delete_node(self):
         selected_items = self.tree.selectedItems()
         if not selected_items:
@@ -333,6 +466,8 @@ class ArchitectureBuilder(QMainWindow):
             (item.parent() or self.tree.invisibleRootItem()).removeChild(item)
         self.name_input.clear()
         self.desc_input.clear()
+
+        self.save_snapshot()
 
     def export_to_markdown(self):
         if self.tree.topLevelItemCount() == 0:
